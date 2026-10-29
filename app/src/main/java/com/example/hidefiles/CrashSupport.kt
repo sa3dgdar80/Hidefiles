@@ -18,7 +18,8 @@ class App : Application() {
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
             try {
                 File(filesDir, "crash.txt").writeText(Log.getStackTraceString(e))
-            } catch (_: Throwable) {
+            } catch (ex: Throwable) {
+                // تجاهل
             }
             old?.uncaughtException(t, e)
         }
