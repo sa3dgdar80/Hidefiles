@@ -11,7 +11,10 @@ import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.view.WindowManager
 import android.webkit.MimeTypeMap
+import android.widget.MediaController
 import android.widget.Toast
+import android.widget.VideoView
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -39,6 +42,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.fragment.app.FragmentActivity
@@ -68,6 +72,7 @@ class MainActivity : FragmentActivity() {
         setContent {
             MaterialTheme {
                 if (unlocked) {
+                    // skipLock يُستخدم فقط عند فتح شاشة اختيار الملفات
                     VaultScreen(beforeLeave = { skipLock = true })
                 } else {
                     Box(Modifier.fillMaxSize(), Alignment.Center) {
@@ -162,17 +167,51 @@ private fun restoreFile(ctx: Context, f: File) {
     f.delete()
 }
 
-private fun openFile(ctx: Context, f: File, beforeLeave: () -> Unit) {
+// للمستندات فقط (غير الصور والفيديو): تُفتح في تطبيق خارجي بمهمة مستقلة
+private fun openExternal(ctx: Context, f: File) {
     val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", f)
     val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(f.extension.lowercase()) ?: "*/*"
     val intent = Intent(Intent.ACTION_VIEW)
         .setDataAndType(uri, mime)
-        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-    beforeLeave()
+        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
     try {
         ctx.startActivity(intent)
     } catch (e: Exception) {
         Toast.makeText(ctx, "لا يوجد تطبيق لفتح هذا الملف", Toast.LENGTH_SHORT).show()
+    }
+}
+
+@Composable
+fun MediaViewer(file: File, loader: ImageLoader, onClose: () -> Unit) {
+    BackHandler(onBack = onClose)
+    Box(Modifier.fillMaxSize().background(Color.Black)) {
+        if (file.isVideo()) {
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { c ->
+                    VideoView(c).apply {
+                        val mc = MediaController(c)
+                        mc.setAnchorView(this)
+                        setMediaController(mc)
+                        setVideoPath(file.absolutePath)
+                        setOnPreparedListener { start() }
+                    }
+                },
+                onRelease = { it.stopPlayback() }
+            )
+        } else {
+            AsyncImage(
+                model = file,
+                contentDescription = null,
+                imageLoader = loader,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+        TextButton(
+            onClick = onClose,
+            modifier = Modifier.align(Alignment.TopStart).padding(8.dp)
+        ) { Text("✕ إغلاق", color = Color.White) }
     }
 }
 
@@ -184,6 +223,7 @@ fun VaultScreen(beforeLeave: () -> Unit) {
     var files by remember { mutableStateOf(listVault(dir)) }
     var selected by remember { mutableStateOf(setOf<File>()) }
     var confirmDelete by remember { mutableStateOf(false) }
+    var viewing by remember { mutableStateOf<File?>(null) }
     val scope = rememberCoroutineScope()
     val loader = remember {
         ImageLoader.Builder(ctx).components { add(VideoFrameDecoder.Factory()) }.build()
@@ -201,52 +241,124 @@ fun VaultScreen(beforeLeave: () -> Unit) {
         }
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text(if (selected.isEmpty()) "الخزنة" else "${selected.size} محدد") },
-                actions = {
-                    if (selected.isNotEmpty()) {
-                        TextButton(onClick = {
-                            val items = selected.toList()
-                            scope.launch {
-                                withContext(Dispatchers.IO) { items.forEach { restoreFile(ctx, it) } }
-                                selected = emptySet()
-                                files = listVault(dir)
-                                Toast.makeText(ctx, "تمت الاستعادة إلى Downloads", Toast.LENGTH_SHORT).show()
+    val current = viewing
+    if (current != null) {
+        MediaViewer(current, loader) { viewing = null }
+    } else {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = { Text(if (selected.isEmpty()) "الخزنة" else "${selected.size} محدد") },
+                    actions = {
+                        if (selected.isNotEmpty()) {
+                            TextButton(onClick = {
+                                val items = selected.toList()
+                                scope.launch {
+                                    withContext(Dispatchers.IO) { items.forEach { restoreFile(ctx, it) } }
+                                    selected = emptySet()
+                                    files = listVault(dir)
+                                    Toast.makeText(ctx, "تمت الاستعادة إلى Downloads", Toast.LENGTH_SHORT).show()
+                                }
+                            }) { Text("استعادة") }
+                            TextButton(onClick = { confirmDelete = true }) { Text("حذف") }
+                            TextButton(onClick = { selected = emptySet() }) { Text("إلغاء") }
+                        }
+                    }
+                )
+            },
+            floatingActionButton = {
+                FloatingActionButton(onClick = {
+                    beforeLeave()
+                    picker.launch(arrayOf("*/*"))
+                }) { Icon(Icons.Default.Add, contentDescription = "إخفاء ملفات") }
+            }
+        ) { pad ->
+            if (files.isEmpty()) {
+                Box(Modifier.fillMaxSize().padding(pad), Alignment.Center) {
+                    Text("اضغط + لإخفاء ملفات")
+                }
+            } else {
+                LazyVerticalGrid(
+                    columns = GridCells.Adaptive(110.dp),
+                    modifier = Modifier.padding(pad),
+                    contentPadding = PaddingValues(4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    items(files, key = { it.absolutePath }) { f ->
+                        Box(
+                            Modifier
+                                .aspectRatio(1f)
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(Color.DarkGray)
+                                .combinedClickable(
+                                    onClick = {
+                                        if (selected.isNotEmpty()) {
+                                            selected = if (f in selected) selected - f else selected + f
+                                        } else if (f.isImage() || f.isVideo()) {
+                                            viewing = f
+                                        } else {
+                                            openExternal(ctx, f)
+                                        }
+                                    },
+                                    onLongClick = {
+                                        selected = if (f in selected) selected - f else selected + f
+                                    }
+                                )
+                        ) {
+                            if (f.isImage() || f.isVideo()) {
+                                AsyncImage(
+                                    model = f,
+                                    contentDescription = null,
+                                    imageLoader = loader,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            } else {
+                                Text(
+                                    f.name,
+                                    color = Color.White,
+                                    fontSize = 11.sp,
+                                    maxLines = 3,
+                                    modifier = Modifier.align(Alignment.Center).padding(4.dp)
+                                )
                             }
-                        }) { Text("استعادة") }
-                        TextButton(onClick = { confirmDelete = true }) { Text("حذف") }
-                        TextButton(onClick = { selected = emptySet() }) { Text("إلغاء") }
+                            if (f.isVideo()) {
+                                Icon(
+                                    Icons.Default.PlayArrow, null, tint = Color.White,
+                                    modifier = Modifier.align(Alignment.Center).size(36.dp)
+                                )
+                            }
+                            if (f in selected) {
+                                Box(
+                                    Modifier.fillMaxSize().background(Color(0x884488FF)),
+                                    contentAlignment = Alignment.Center
+                                ) { Text("✓", color = Color.White, fontSize = 28.sp) }
+                            }
+                        }
                     }
                 }
-            )
-        },
-        floatingActionButton = {
-            FloatingActionButton(onClick = {
-                beforeLeave()
-                picker.launch(arrayOf("*/*"))
-            }) { Icon(Icons.Default.Add, contentDescription = "إخفاء ملفات") }
-        }
-    ) { pad ->
-        if (files.isEmpty()) {
-            Box(Modifier.fillMaxSize().padding(pad), Alignment.Center) {
-                Text("اضغط + لإخفاء ملفات")
             }
-        } else {
-            LazyVerticalGrid(
-                columns = GridCells.Adaptive(110.dp),
-                modifier = Modifier.padding(pad),
-                contentPadding = PaddingValues(4.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                items(files, key = { it.absolutePath }) { f ->
-                    Box(
-                        Modifier
-                            .aspectRatio(1f)
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(Color.DarkGray)
+        }
+
+        if (confirmDelete) {
+            AlertDialog(
+                onDismissRequest = { confirmDelete = false },
+                title = { Text("حذف نهائي؟") },
+                text = { Text("سيتم حذف ${selected.size} ملف نهائياً") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        selected.forEach { it.delete() }
+                        selected = emptySet()
+                        files = listVault(dir)
+                        confirmDelete = false
+                    }) { Text("حذف") }
+                },
+                dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("إلغاء") } }
+            )
+        }
+    }
+}                   .background(Color.DarkGray)
                             .combinedClickable(
                                 onClick = {
                                     if (selected.isNotEmpty()) {
